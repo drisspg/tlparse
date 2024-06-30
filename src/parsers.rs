@@ -458,6 +458,204 @@ impl StructuredLogParser for ArtifactParser {
         }
     }
 }
+use anyhow::{Context, Result};
+use std::collections::HashMap;
+use std::io::Write;
+use std::process::Command;
+
+pub struct AOTForwardGraphParser;
+
+impl StructuredLogParser for AOTForwardGraphParser {
+    fn name(&self) -> &'static str {
+        "graph_viz"
+    }
+
+    fn get_metadata<'e>(&self, e: &'e Envelope) -> Option<Metadata<'e>> {
+        e.aot_forward_graph.as_ref().map(|m| Metadata::Empty(m))
+    }
+
+    fn parse<'e>(
+        &self,
+        lineno: usize,
+        _metadata: Metadata<'e>,
+        _rank: Option<u32>,
+        compile_id: &Option<CompileId>,
+        payload: &str,
+    ) -> Result<ParserResults> {
+        let dot_content = generate_dot_graph(payload)?;
+        let svg_content = generate_svg_from_dot(&dot_content)?;
+        let html_content = generate_html_with_svg(&svg_content)?;
+        let file_path = format!("{}.html", self.name());
+        simple_file_output(&file_path, lineno, compile_id, &html_content)
+    }
+}
+
+fn generate_dot_graph(payload: &str) -> Result<String> {
+    let mut dot = String::from("digraph pytorch_fx_graph {\n");
+    dot.push_str("  node [shape=box];\n");
+
+    let mut node_map = HashMap::new();
+    let mut node_count = 0;
+
+    // Add input node
+    dot.push_str("  input [label=\"input\"];\n");
+    node_map.insert("primals_1".to_string(), "input".to_string());
+
+    for line in payload.lines() {
+        if line.contains('=') {
+            let parts: Vec<&str> = line.split('=').collect();
+            println!("Number of parts {}", parts.len());
+            if parts.len() <= 3 {
+                let (output, out_info) = parts[0]
+                    .trim()
+                    .split_once(':')
+                    .map_or(("", ""), |(a, b)| (a.trim(), b.trim()));
+                let operation = parts[1].trim();
+                println!(
+                    "output {:?} | metadata {:?} | operation {:?}",
+                    output, out_info, operation
+                );
+                if let Some((_op_name, inputs)) = operation.split_once('(') {
+                    node_count += 1;
+                    let node_id = format!("n{}", node_count);
+                    dot.push_str(&format!(
+                        "  {} [label=\"{}|{}\"];\n",
+                        node_id,
+                        escape_dot_label(output),
+                        escape_dot_label(out_info)
+                    ));
+                    node_map.insert(output.to_string(), node_id.clone());
+                    let inputs: Vec<&str> = inputs.trim_end_matches(')').split(',').collect();
+                    for input in inputs {
+                        let input = input.trim();
+                        if input != "2" {
+                            // Ignore constant values
+                            if let Some(input_node) = node_map.get(input) {
+                                dot.push_str(&format!("  {} -> {};\n", input_node, node_id));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Add return node
+    if let Some(last_node) = node_map.values().last() {
+        dot.push_str("  return [label=\"return\"];\n");
+        dot.push_str(&format!("  {} -> return;\n", last_node));
+    }
+
+    dot.push_str("}\n");
+    println!("{}", dot);
+    Ok(dot)
+}
+
+fn escape_dot_label(s: &str) -> String {
+    s.replace("\"", "\\\"")
+     .replace("|", "\\|")
+     .replace("{", "\\{")
+     .replace("}", "\\}")
+     .replace("<", "\\<")
+     .replace(">", "\\>")
+     .replace("&", "\\&")
+}
+
+fn generate_svg_from_dot(dot_content: &str) -> Result<String> {
+    let mut child = Command::new("dot")
+        .arg("-Tsvg")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .context("Failed to spawn dot command")?;
+
+    {
+        let stdin = child.stdin.as_mut().context("Failed to open stdin")?;
+        stdin
+            .write_all(dot_content.as_bytes())
+            .context("Failed to write to dot stdin")?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .context("Failed to read dot stdout")?;
+
+    String::from_utf8(output.stdout).context("Failed to parse dot output as UTF-8")
+}
+
+fn generate_html_with_svg(svg_content: &str) -> Result<String> {
+    let html = format!(
+        r#"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PyTorch FX Graph Visualization</title>
+    <style>
+        body {{ margin: 0; padding: 0; display: flex; justify-content: center; align-items: center; height: 100vh; }}
+        #graph-container {{ max-width: 100%; max-height: 100%; overflow: auto; }}
+        svg {{ width: 100%; height: auto; }}
+    </style>
+</head>
+<body>
+    <div id="graph-container">
+        {svg_content}
+    </div>
+    <script>
+        const svg = document.querySelector('svg');
+        const container = document.getElementById('graph-container');
+
+        svg.addEventListener('mousedown', startDrag);
+        svg.addEventListener('mousemove', drag);
+        svg.addEventListener('mouseup', endDrag);
+        svg.addEventListener('mouseleave', endDrag);
+
+        let isPanning = false;
+        let startPoint = {{ x: 0, y: 0 }};
+        let endPoint = {{ x: 0, y: 0 }};
+        let scale = 1;
+
+        function startDrag(evt) {{
+            isPanning = true;
+            startPoint = {{ x: evt.clientX, y: evt.clientY }};
+        }}
+
+        function drag(evt) {{
+            if (!isPanning) return;
+            endPoint = {{ x: evt.clientX, y: evt.clientY }};
+            const dx = (endPoint.x - startPoint.x) / scale;
+            const dy = (endPoint.y - startPoint.y) / scale;
+            container.scrollLeft -= dx;
+            container.scrollTop -= dy;
+            startPoint = endPoint;
+        }}
+
+        function endDrag(evt) {{
+            isPanning = false;
+        }}
+
+        container.addEventListener('wheel', (evt) => {{
+            evt.preventDefault();
+            const xs = (evt.clientX - container.offsetLeft) / scale;
+            const ys = (evt.clientY - container.offsetTop) / scale;
+            scale += evt.deltaY * -0.01;
+            scale = Math.min(Math.max(0.1, scale), 10);
+            svg.style.transform = `scale(${{scale}})`;
+            const xd = xs * scale - xs;
+            const yd = ys * scale - ys;
+            container.scrollLeft += xd;
+            container.scrollTop += yd;
+        }});
+    </script>
+</body>
+</html>
+        "#,
+        svg_content = svg_content
+    );
+
+    Ok(html)
+}
 
 // Register your parser here
 pub fn default_parsers<'t>(tt: &'t TinyTemplate<'t>) -> Vec<Box<dyn StructuredLogParser + 't>> {
@@ -489,6 +687,7 @@ pub fn default_parsers<'t>(tt: &'t TinyTemplate<'t>) -> Vec<Box<dyn StructuredLo
         Box::new(AOTAutogradBackwardCompilationMetricsParser { tt }), // TODO: use own tt instances
         Box::new(LinkParser),
         Box::new(ArtifactParser),
+        Box::new(AOTForwardGraphParser),
     ];
 
     result
